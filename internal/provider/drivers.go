@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/chainguard-dev/clog"
 	"github.com/chainguard-dev/terraform-provider-imagetest/internal/drivers"
+	aks "github.com/chainguard-dev/terraform-provider-imagetest/internal/drivers/aks"
 	dockerindocker "github.com/chainguard-dev/terraform-provider-imagetest/internal/drivers/docker_in_docker"
 	mc2 "github.com/chainguard-dev/terraform-provider-imagetest/internal/drivers/ec2"
 	ekswitheksctl "github.com/chainguard-dev/terraform-provider-imagetest/internal/drivers/eks_with_eksctl"
@@ -27,6 +28,7 @@ import (
 type DriverResourceModel string
 
 const (
+	DriverAKS            DriverResourceModel = "aks"
 	DriverK3sInDocker    DriverResourceModel = "k3s_in_docker"
 	DriverDockerInDocker DriverResourceModel = "docker_in_docker"
 	DriverEKSWithEksctl  DriverResourceModel = "eks_with_eksctl"
@@ -34,10 +36,24 @@ const (
 )
 
 type TestsDriversResourceModel struct {
+	AKS            *AKSDriverResourceModel            `tfsdk:"aks"`
 	K3sInDocker    *K3sInDockerDriverResourceModel    `tfsdk:"k3s_in_docker"`
 	DockerInDocker *DockerInDockerDriverResourceModel `tfsdk:"docker_in_docker"`
 	EKSWithEksctl  *EKSWithEksctlDriverResourceModel  `tfsdk:"eks_with_eksctl"`
 	EC2            *EC2DriverResourceModel            `tfsdk:"ec2"`
+}
+
+type AKSDriverResourceModel struct {
+	ResourceGroup     types.String      `tfsdk:"resource_group"`
+	Location          types.String      `tfsdk:"location"`
+	NodeCount         types.Int32       `tfsdk:"node_count"`
+	NodeVMSize        types.String      `tfsdk:"node_vm_size"`
+	NodeDiskSize      types.Int32       `tfsdk:"node_disk_size"`
+	NodeDiskType      types.String      `tfsdk:"node_disk_type"`
+	NodePoolName      types.String      `tfsdk:"node_pool_name"`
+	SubscriptionID    types.String      `tfsdk:"subscription_id"`
+	KubernetesVersion types.String      `tfsdk:"kubernetes_version"`
+	Tags              map[string]string `tfsdk:"tags"`
 }
 
 type K3sInDockerDriverResourceModel struct {
@@ -136,6 +152,51 @@ func (t TestsResource) LoadDriver(ctx context.Context, data *TestsResourceModel)
 	}
 
 	switch data.Driver {
+	case DriverAKS:
+		cfg := driversCfg.AKS
+		if cfg == nil {
+			cfg = &AKSDriverResourceModel{}
+		}
+
+		// Build registry auth config from the resolved repo.
+		// TODO: consider reusing the registry related code since it's not driver
+		// specific.
+		registries := make(map[string]*aks.RegistryConfig)
+		r, err := name.NewRegistry(repo.RegistryStr())
+		if err != nil {
+			return nil, fmt.Errorf("invalid registry name %s: %w", repo.RegistryStr(), err)
+		}
+		a, err := authn.DefaultKeychain.Resolve(r)
+		if err != nil {
+			return nil, fmt.Errorf("resolving keychain for registry %s: %w", r.String(), err)
+		}
+		acfg, err := a.Authorization()
+		if err != nil {
+			return nil, fmt.Errorf("getting authorization for registry %s: %w", r.String(), err)
+		}
+		registries[repo.RegistryStr()] = &aks.RegistryConfig{
+			Auth: &aks.RegistryAuthConfig{
+				Username: acfg.Username,
+				Password: acfg.Password,
+				Auth:     acfg.Auth,
+			},
+		}
+
+		return aks.NewDriver(id, aks.Options{
+			ResourceGroup:     cfg.ResourceGroup.ValueString(),
+			Location:          cfg.Location.ValueString(),
+			NodeCount:         cfg.NodeCount.ValueInt32(),
+			NodeVMSize:        cfg.NodeVMSize.ValueString(),
+			NodeDiskSize:      cfg.NodeDiskSize.ValueInt32(),
+			NodeDiskType:      cfg.NodeDiskType.ValueString(),
+			NodePoolName:      cfg.NodePoolName.ValueString(),
+			Timeout:           timeout,
+			SubscriptionID:    cfg.SubscriptionID.ValueString(),
+			KubernetesVersion: cfg.KubernetesVersion.ValueString(),
+			Tags:              cfg.Tags,
+			Registries:        registries,
+		})
+
 	case DriverK3sInDocker:
 		cfg := driversCfg.K3sInDocker
 		if cfg == nil {
@@ -439,6 +500,53 @@ func DriverResourceSchema(ctx context.Context) schema.SingleNestedAttribute {
 		Description: "The resource specific driver configuration. This is merged with the provider scoped drivers configuration.",
 		Optional:    true,
 		Attributes: map[string]schema.Attribute{
+			"aks": schema.SingleNestedAttribute{
+				Description: "The AKS driver",
+				Optional:    true,
+				Attributes: map[string]schema.Attribute{
+					"resource_group": schema.StringAttribute{
+						Description: "The Azure resource group for the AKS driver",
+						Optional:    false,
+					},
+					"location": schema.StringAttribute{
+						Description: "The Azure region for the AKS driver (default is westeurope)",
+						Optional:    true,
+					},
+					"node_count": schema.Int32Attribute{
+						Description: "The number of nodes to use for the AKS driver (default is 1)",
+						Optional:    true,
+					},
+					"node_vm_size": schema.StringAttribute{
+						Description: "The node size to use for the AKS driver (default is Standard_DS2_v2)",
+						Optional:    true,
+					},
+					"node_pool_name": schema.StringAttribute{
+						Description: "The node pool name to use for the AKS driver, defaults to the cluster name",
+						Optional:    true,
+					},
+					"node_disk_size": schema.Int32Attribute{
+						Description: "Use a custom VM disk size (GB) instead of the one defined by the VM size.",
+						Optional:    true,
+					},
+					"node_disk_type": schema.Int32Attribute{
+						Description: "Ephemeral or Managed. Defaults to 'Ephemeral', which provide better performance but aren't persistent.",
+						Optional:    true,
+					},
+					"subscription_id": schema.StringAttribute{
+						Description: "The Azure subscription ID for the AKS driver, defaults to AZURE_SUBSCRIPTION_ID env var",
+						Optional:    true,
+					},
+					"kubernetes_version": schema.StringAttribute{
+						Description: "The Kubernetes version to deploy, uses the Azure default if unspecified",
+						Optional:    true,
+					},
+					"tags": schema.MapAttribute{
+						Description: "Additional tags to apply to all AKS resources created by the driver. Auto-generated tags (imagetest, imagetest:test-name, imagetest:cluster-name) are always included.",
+						ElementType: types.StringType,
+						Optional:    true,
+					},
+				},
+			},
 			"k3s_in_docker": schema.SingleNestedAttribute{
 				Description: "The k3s_in_docker driver",
 				Optional:    true,
