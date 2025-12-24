@@ -8,9 +8,12 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/authorization/armauthorization"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v8"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/msi/armmsi"
 	"github.com/chainguard-dev/clog"
 	"github.com/chainguard-dev/terraform-provider-imagetest/internal/docker"
 	"github.com/chainguard-dev/terraform-provider-imagetest/internal/drivers"
@@ -51,8 +54,11 @@ type driver struct {
 	kcfg        *rest.Config
 
 	aksClient *armcontainerservice.ManagedClustersClient
+	aksCred   azcore.TokenCredential
 
 	registries map[string]*RegistryConfig
+
+	podIdentityAssociations []*PodIdentityAssociationOptions
 }
 
 type Options struct {
@@ -89,12 +95,7 @@ type Options struct {
 
 	Registries map[string]*RegistryConfig
 
-	// TODO: check if the following are required.
-	// DNSPrefix string
-	//
-	// Other possible settings:
-	// node_image_reference - Custom VM image for nodes (for Chainguard images)
-	// workload_identity_associations - Azure Workload Identity (parity with EKS Pod Identity)
+	PodIdentityAssociations []*PodIdentityAssociationOptions
 }
 
 // RegistryConfig holds authentication configuration for a container registry.
@@ -107,6 +108,21 @@ type RegistryAuthConfig struct {
 	Username string
 	Password string
 	Auth     string
+}
+
+type PodIdentityAssociationOptions struct {
+	ServiceAccountName string
+	Namespace          string
+	RoleAssignments    []*RoleAssignment
+}
+
+type RoleAssignment struct {
+	// Role example:
+	// "/subscriptions/<sub-id>/providers/Microsoft.Authorization/roleDefinitions/<role-guid>"
+	RoleDefinitionID string
+	// Scope example:
+	// "/subscriptions/<sub-id>/resourceGroups/<rg>/providers/Microsoft.KeyVault/vaults/<kv-name>"
+	Scope string
 }
 
 // NewDriver creates a new AKS driver instance that uses the Azure SDK to
@@ -155,9 +171,30 @@ func NewDriver(name string, opts Options) (drivers.Tester, error) {
 	}
 	switch k.nodeDiskType {
 	case "", "Ephemeral", "Managed":
+	default:
+		return nil, fmt.Errorf(
+			"invalid node disk type: %s, supported types: Ephemeral, Managed", k.nodeDiskType)
 	}
-	return nil, fmt.Errorf(
-		"invalid node disk type: %s, supported types: Ephemeral, Managed", k.nodeDiskType)
+	if opts.PodIdentityAssociations != nil {
+		for _, v := range opts.PodIdentityAssociations {
+			if v == nil {
+				continue
+			}
+			podIdentityAssociation := &PodIdentityAssociationOptions{
+				Namespace:          v.Namespace,
+				ServiceAccountName: v.ServiceAccountName,
+			}
+			for _, role := range v.RoleAssignments {
+				if role == nil {
+					continue
+				}
+				podIdentityAssociation.RoleAssignments = append(
+					podIdentityAssociation.RoleAssignments, role,
+				)
+			}
+			k.podIdentityAssociations = append(k.podIdentityAssociations, podIdentityAssociation)
+		}
+	}
 	return k, nil
 }
 
@@ -165,13 +202,14 @@ func (k *driver) Setup(ctx context.Context) error {
 	log := clog.FromContext(ctx)
 
 	// Obtain Azure credentials based on environment variables.
-	cred, err := azidentity.NewDefaultAzureCredential(nil)
+	aksCred, err := azidentity.NewDefaultAzureCredential(nil)
 	if err != nil {
 		return fmt.Errorf("unable to obtain Azure credentials: %v", err)
 	}
+	k.aksCred = aksCred
 
 	aksClient, err := armcontainerservice.NewManagedClustersClient(
-		k.subscriptionID, cred, nil)
+		k.subscriptionID, k.aksCred, nil)
 	if err != nil {
 		return fmt.Errorf("unable to create AKS client: %v", err)
 	}
@@ -207,12 +245,15 @@ func (k *driver) Setup(ctx context.Context) error {
 		}
 	}
 
-	err = k.writeKubeConfig(ctx)
+	err = k.createPodIdentityAssociation(ctx)
 	if err != nil {
 		return err
 	}
 
-	// TODO: handle workload identity.
+	err = k.writeKubeConfig(ctx)
+	if err != nil {
+		return err
+	}
 
 	config, err := clientcmd.BuildConfigFromFlags("", k.kubeconfig)
 	if err != nil {
@@ -241,6 +282,8 @@ func (k *driver) createCluster(ctx context.Context) error {
 		nodeDiskType = ptr(armcontainerservice.OSDiskTypeManaged)
 	}
 
+	workload_identity_enabled := k.podIdentityAssociations != nil
+
 	poller, err := k.aksClient.BeginCreateOrUpdate(
 		ctx,
 		k.resourceGroup,
@@ -262,11 +305,16 @@ func (k *driver) createCluster(ctx context.Context) error {
 						Type:         ptr(armcontainerservice.AgentPoolTypeVirtualMachineScaleSets),
 					},
 				},
-				// Identity: &armcontainerservice.ManagedClusterIdentity{
-				// 	Type: ptr(armcontainerservice.ResourceIdentityTypeSystemAssigned),
-				// },
 				NetworkProfile: &armcontainerservice.NetworkProfile{
 					NetworkPlugin: ptr(armcontainerservice.NetworkPluginAzure),
+				},
+				OidcIssuerProfile: &armcontainerservice.ManagedClusterOIDCIssuerProfile{
+					Enabled: &workload_identity_enabled,
+				},
+				SecurityProfile: &armcontainerservice.ManagedClusterSecurityProfile{
+					WorkloadIdentity: &armcontainerservice.ManagedClusterSecurityProfileWorkloadIdentity{
+						Enabled: &workload_identity_enabled,
+					},
 				},
 			},
 		},
@@ -283,8 +331,114 @@ func (k *driver) createCluster(ctx context.Context) error {
 		return fmt.Errorf("failed to create AKS cluster: %v", err)
 	}
 
-	// TODO: store the cluster id.
 	log.Infof("Created AKS cluster: %s", resp.ID)
+	return nil
+}
+
+// Please refer to the official AKS documentation:
+//
+//	https://learn.microsoft.com/en-us/azure/aks/workload-identity-overview
+//	https://learn.microsoft.com/en-us/graph/api/resources/federatedidentitycredentials-overview
+func (k *driver) createPodIdentityAssociation(ctx context.Context) error {
+	if k.podIdentityAssociations == nil {
+		return fmt.Errorf("no pod identity associations provided")
+	}
+
+	aksMIClient, err := armmsi.NewUserAssignedIdentitiesClient(
+		k.subscriptionID, k.aksCred, nil)
+	if err != nil {
+		return fmt.Errorf("unable to create user assigned idenitity client: %v", err)
+	}
+	aksFICClient, err := armmsi.NewFederatedIdentityCredentialsClient(
+		k.subscriptionID, k.aksCred, nil)
+	if err != nil {
+		return fmt.Errorf("unable to create federated idenitity client: %v", err)
+	}
+	aksRoleClient, err := armauthorization.NewRoleAssignmentsClient(
+		k.subscriptionID, k.aksCred, nil)
+	if err != nil {
+		return fmt.Errorf("unable to create role client: %v", err)
+	}
+
+	cluster, err := k.aksClient.Get(ctx, k.resourceGroup, k.clusterName, nil)
+	if err != nil {
+		return fmt.Errorf("unable to retrieve cluster: %v", err)
+	}
+	oidcIssuerURL := *cluster.Properties.OidcIssuerProfile.IssuerURL
+
+	for _, v := range k.podIdentityAssociations {
+		if v == nil {
+			continue
+		}
+
+		identityName := fmt.Sprintf(
+			"%s-%s-%s", k.clusterName, v.Namespace, v.ServiceAccountName)
+		federatedIdentityName := fmt.Sprintf("%s-fed", identityName)
+
+		// TODO: cleanup identities that were created by us.
+
+		miResp, err := aksMIClient.CreateOrUpdate(
+			ctx,
+			k.resourceGroup,
+			identityName,
+			armmsi.Identity{
+				Location: &k.location,
+			},
+			nil,
+		)
+		if err != nil {
+			return fmt.Errorf("unable to create identity: %v", err)
+		}
+
+		principalID := *miResp.Properties.PrincipalID
+		credentialSubject := fmt.Sprintf("system:serviceaccount:%s:%s:",
+			v.Namespace, v.ServiceAccountName,
+		)
+
+		_, err = aksFICClient.CreateOrUpdate(
+			ctx,
+			k.resourceGroup,
+			identityName,
+			federatedIdentityName,
+			armmsi.FederatedIdentityCredential{
+				Properties: &armmsi.FederatedIdentityCredentialProperties{
+					Issuer:  &oidcIssuerURL,
+					Subject: &credentialSubject,
+					Audiences: []*string{
+						ptr("api://AzureADTokenExchange"),
+					},
+				},
+			},
+			nil,
+		)
+		if err != nil {
+			return fmt.Errorf("unable to create federated identity: %v", err)
+		}
+
+		assignmentName := uuid.New().String()
+
+		for _, role := range v.RoleAssignments {
+			_, err = aksRoleClient.Create(
+				ctx,
+				role.Scope,
+				assignmentName,
+				armauthorization.RoleAssignmentCreateParameters{
+					Properties: &armauthorization.RoleAssignmentProperties{
+						RoleDefinitionID: ptr(role.RoleDefinitionID),
+						PrincipalID:      &principalID,
+					},
+				},
+				nil,
+			)
+			if err != nil {
+				return fmt.Errorf("unable to create role assignment: %v", err)
+			}
+		}
+
+		log.Infof("Created pod identity association for service account %s/%s for cluster %s.",
+			v.Namespace, v.ServiceAccountName, k.clusterName)
+	}
+
 	return nil
 }
 
